@@ -128,6 +128,8 @@ EOF
 
   # Release keys may only run the app's deploy script.
   local pub
+  [ -f "$DEPLOY_HOME/.ssh/authorized_keys" ] \
+    || install -o deploy -g deploy -m 600 /dev/null "$DEPLOY_HOME/.ssh/authorized_keys"
   for pub in "${release_keys[@]}"; do
     if ! grep -qF "$pub" "$DEPLOY_HOME/.ssh/authorized_keys"; then
       echo "command=\"$app_dir/deploy/deploy.sh\",restrict $pub" >> "$DEPLOY_HOME/.ssh/authorized_keys"
