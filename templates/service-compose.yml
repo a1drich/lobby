@@ -1,0 +1,20 @@
+# Starting point for a host-level service kept in THIS repo, under
+# services/<name>/compose.yml: something that belongs to the server rather than to
+# an app (uptime monitoring, a status page, a shared tool). Replace `mysvc` with the
+# service's name and example.com with its host.
+name: mysvc
+
+services:
+  mysvc:
+    image: traefik/whoami:v1.10   # pin an exact version
+    restart: unless-stopped
+    networks: [proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.mysvc.rule=Host(`mysvc.example.com`)
+      - traefik.http.routers.mysvc.entrypoints=websecure
+      - traefik.http.services.mysvc.loadbalancer.server.port=80
+
+networks:
+  proxy:
+    external: true

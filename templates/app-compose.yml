@@ -1,0 +1,50 @@
+# Starting point for an app's production compose file. It lives in the APP's repo
+# (for example deploy/compose.yml), not here. Replace `myapp` everywhere with the
+# app's name from `lobby add-app`, and example.com with its domain.
+name: myapp
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: myapp
+      POSTGRES_DB: myapp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it in deploy/.env}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [internal]          # never on proxy, never published
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myapp"]
+      interval: 10s
+
+  web:
+    image: myapp-web:${MYAPP_TAG:?}
+    build: ..
+    restart: unless-stopped
+    env_file: ../.env
+    networks: [internal, proxy]   # proxy only for services Traefik routes to
+    depends_on:
+      db: { condition: service_healthy }
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.myapp-web.rule=Host(`www.example.com`)
+      - traefik.http.routers.myapp-web.entrypoints=websecure
+      - traefik.http.routers.myapp-web.middlewares=myapp-hsts
+      - traefik.http.services.myapp-web.loadbalancer.server.port=8000
+      - traefik.http.middlewares.myapp-hsts.headers.stsSeconds=31536000
+      - traefik.http.middlewares.myapp-hsts.headers.stsIncludeSubdomains=true
+      # Bare domain -> www
+      - traefik.http.routers.myapp-apex.rule=Host(`example.com`)
+      - traefik.http.routers.myapp-apex.entrypoints=websecure
+      - traefik.http.routers.myapp-apex.middlewares=myapp-apex
+      - traefik.http.middlewares.myapp-apex.redirectregex.regex=^https://example\.com/(.*)
+      - traefik.http.middlewares.myapp-apex.redirectregex.replacement=https://www.example.com/$${1}
+      - traefik.http.middlewares.myapp-apex.redirectregex.permanent=true
+
+networks:
+  internal:
+  proxy:
+    external: true
+
+volumes:
+  pgdata:

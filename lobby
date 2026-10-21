@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# lobby: one server, many apps, one front door.
+#
+#   lobby setup                                  provision this server (safe to rerun on a live one)
+#   lobby edge                                   start or update Traefik
+#   lobby add-app <name> <owner/repo> [--release-key '<public key>']...
+#                                                check an app in: deploy key, SSH alias,
+#                                                directories, release keys, checkout
+#   lobby list                                   apps checked in, and what's running
+#
+# Run as root on the server. Before the server has a checkout of lobby, stream it:
+#   ssh root@<host> 'bash -s' -- setup < lobby
+set -euo pipefail
+
+LOBBY_DIR=${LOBBY_DIR:-/opt/lobby}
+DEPLOY_HOME=/home/deploy
+SWAP_SIZE=${SWAP_SIZE:-2G}
+PACKAGES=(docker.io docker-compose-v2 docker-buildx git curl ufw unattended-upgrades)
+
+log() { printf '== %s\n' "$*"; }
+die() { printf 'lobby: %s\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "run as root"; }
+usage() { sed -n '2,13p' "${BASH_SOURCE[0]:-lobby}" 2>/dev/null | sed 's/^# \{0,1\}//' || true; exit "${1:-1}"; }
+
+cmd_setup() {
+  need_root
+
+  # Only install what's missing: never upgrade Docker under running apps.
+  local missing=() pkg
+  for pkg in "${PACKAGES[@]}"; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    log "installing ${missing[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y -q "${missing[@]}"
+  fi
+  systemctl enable --now docker >/dev/null 2>&1
+
+  log "firewall: ssh, http, https"
+  ufw allow OpenSSH >/dev/null
+  ufw allow 80/tcp >/dev/null
+  ufw allow 443/tcp >/dev/null
+  ufw --force enable >/dev/null
+
+  # Image builds spike memory; swap keeps them from OOM-killing running apps.
+  if ! swapon --show | grep -q .; then
+    log "swap ($SWAP_SIZE)"
+    fallocate -l "$SWAP_SIZE" /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  fi
+  if ! grep -qs '^vm.swappiness=10' /etc/sysctl.d/*.conf; then
+    echo 'vm.swappiness=10' > /etc/sysctl.d/99-swap.conf
+    sysctl -q vm.swappiness=10
+  fi
+
+  log "deploy user"
+  id deploy >/dev/null 2>&1 || useradd --create-home --shell /bin/bash deploy
+  usermod -aG docker deploy
+  install -d -o deploy -g deploy -m 700 "$DEPLOY_HOME/.ssh" "$DEPLOY_HOME/.ssh/config.d"
+  touch "$DEPLOY_HOME/.ssh/authorized_keys" "$DEPLOY_HOME/.ssh/config"
+  chown deploy:deploy "$DEPLOY_HOME/.ssh/authorized_keys" "$DEPLOY_HOME/.ssh/config"
+  chmod 600 "$DEPLOY_HOME/.ssh/authorized_keys"
+  # Each app keeps its SSH settings in its own file under config.d, so no app can
+  # overwrite another's. The Include has to come first.
+  if ! grep -q '^Include config.d/\*' "$DEPLOY_HOME/.ssh/config"; then
+    { echo 'Include config.d/*'; echo; cat "$DEPLOY_HOME/.ssh/config"; } > "$DEPLOY_HOME/.ssh/config.new"
+    mv "$DEPLOY_HOME/.ssh/config.new" "$DEPLOY_HOME/.ssh/config"
+    chown deploy:deploy "$DEPLOY_HOME/.ssh/config"
+  fi
+  chmod 644 "$DEPLOY_HOME/.ssh/config"
+  sudo -u deploy sh -c 'ssh-keyscan -t ed25519 github.com 2>/dev/null >> ~/.ssh/known_hosts; sort -u -o ~/.ssh/known_hosts ~/.ssh/known_hosts'
+
+  log "edge network and certificate volume"
+  docker network inspect proxy >/dev/null 2>&1 || docker network create proxy >/dev/null
+  docker volume inspect traefik_letsencrypt >/dev/null 2>&1 || docker volume create traefik_letsencrypt >/dev/null
+
+  log "server ready. Next: a checkout of lobby at $LOBBY_DIR, then 'lobby edge'"
+}
+
+cmd_edge() {
+  need_root
+  [ -f "$LOBBY_DIR/edge/compose.yml" ] || die "no checkout at $LOBBY_DIR"
+  [ -f "$LOBBY_DIR/edge/.env" ] || cp "$LOBBY_DIR/edge/.env.example" "$LOBBY_DIR/edge/.env"
+  docker compose --project-directory "$LOBBY_DIR/edge" -f "$LOBBY_DIR/edge/compose.yml" up -d
+}
+
+cmd_add_app() {
+  need_root
+  [ $# -ge 2 ] || usage
+  local name=$1 repo=$2; shift 2
+  local release_keys=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --release-key) [ $# -ge 2 ] || usage; release_keys+=("$2"); shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [[ $name =~ ^[a-z][a-z0-9-]*$ ]] || die "name must be lowercase letters, digits and dashes"
+  case $name in edge) die "'$name' is reserved" ;; esac
+  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo must be owner/name"
+  grep -q '^Include config.d/\*' "$DEPLOY_HOME/.ssh/config" 2>/dev/null || die "run 'lobby setup' first"
+
+  local key=$DEPLOY_HOME/.ssh/github-$name app_dir=/opt/$name
+
+  # A read-only GitHub deploy key for this repo alone. GitHub won't take one key on
+  # two repos, so every app gets its own, behind its own SSH alias.
+  if [ ! -f "$key" ]; then
+    sudo -u deploy ssh-keygen -q -t ed25519 -N '' -C "deploy@$name" -f "$key"
+    log "created $key"
+  fi
+  cat > "$DEPLOY_HOME/.ssh/config.d/$name" <<EOF
+# lobby app: $repo
+Host github-$name
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/github-$name
+  IdentitiesOnly yes
+EOF
+  chown deploy:deploy "$DEPLOY_HOME/.ssh/config.d/$name"
+
+  install -d -o deploy -g deploy -m 755 "$app_dir"
+  install -d -o deploy -g deploy -m 700 "/var/backups/$name"
+
+  # Release keys may only run the app's deploy script.
+  local pub
+  for pub in "${release_keys[@]}"; do
+    if ! grep -qF "$pub" "$DEPLOY_HOME/.ssh/authorized_keys"; then
+      echo "command=\"$app_dir/deploy/deploy.sh\",restrict $pub" >> "$DEPLOY_HOME/.ssh/authorized_keys"
+      log "added a release key for $name"
+    fi
+  done
+
+  if [ -d "$app_dir/.git" ]; then
+    log "$app_dir is already cloned"
+  elif sudo -u deploy git ls-remote -q "git@github-$name:$repo.git" >/dev/null 2>&1; then
+    sudo -u deploy git clone -q "git@github-$name:$repo.git" "$app_dir"
+    log "cloned $repo into $app_dir"
+  else
+    log "add this key to $repo as a read-only deploy key, then rerun this command:"
+    echo
+    cat "$key.pub"
+    echo
+    exit 0
+  fi
+  log "$name is checked in. Next: its .env files and first deploy (the app's runbook)"
+}
+
+cmd_list() {
+  local f name repo
+  printf '%-16s %-32s %s\n' APP REPO CONTAINERS
+  for f in "$DEPLOY_HOME"/.ssh/config.d/*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+    repo=$(sed -n 's/^# lobby app: //p' "$f")
+    printf '%-16s %-32s %s\n' "$name" "${repo:--}" \
+      "$(docker ps --filter "label=com.docker.compose.project=$name" --format '{{.Names}}' | wc -l | tr -d ' ') running"
+  done
+  echo
+  docker ps --filter name=^traefik$ --format 'edge: {{.Names}} {{.Status}}'
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1; shift
+case $cmd in
+  setup) cmd_setup "$@" ;;
+  edge) cmd_edge "$@" ;;
+  add-app) cmd_add_app "$@" ;;
+  list) cmd_list "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) usage ;;
+esac
